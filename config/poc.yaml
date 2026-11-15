@@ -1,0 +1,61 @@
+# The POC spec. One model, one traffic shape, the same harness against every provider.
+# Prices are copied as posted on the date given; check them before a new run.
+
+model:
+  served_name: Qwen/Qwen2.5-7B-Instruct          # the name clients send to the self-hosted server, every variant
+  together_id: Qwen/Qwen2.5-7B-Instruct-Turbo    # checked against GET /v1/models before any Together request
+
+# Service-level targets for goodput: the share of requests that meet both.
+slo:
+  ttft_s: 1.0
+  e2e_s: 15.0
+
+workloads:
+  chat:                       # every prompt unique, so no prefix-cache hits
+    input_tokens: 1000
+    output_tokens: 250
+    concurrency: [1, 4, 16, 32, 64, 128]
+    together_max_concurrency: 64   # a shared serverless fleet; past this we measure the rate limit, not the model
+    duration_s: 60            # closed loop for this long at each level; the first wave is dropped as warm-up
+  long_context:               # one shared ~8K-token document, a different question each time
+    input_tokens: 8000
+    output_tokens: 250
+    concurrency: [4]
+    duration_s: 60
+  open_loop:                  # Poisson arrivals at fractions of the closed-loop peak request rate
+    input_tokens: 1000
+    output_tokens: 250
+    load_fractions: [0.5, 0.8]
+    duration_s: 60
+  quality:                    # 50 fixed arithmetic questions at temperature 0; accuracy per arm
+    n: 50
+
+min_n_for_p95: 100            # below this the report shows p95 as "n<100"
+
+providers:
+  together:
+    base_url: https://api.together.xyz/v1
+    usd_per_m_input: 0.30     # pricing page, 2026-11-13: "Qwen2.5 7B Instruct Turbo $0.30 $0.30"
+    usd_per_m_output: 0.30
+  modal_vllm:
+    gpu: L40S
+    cpu_cores: 2
+    memory_gib: 24
+    # modal.com/pricing, 2026-11-13. CPU and memory use the non-preemptible (3x) rates, so the estimate is an upper bound.
+    usd_per_sec_gpu: 0.000542
+    usd_per_sec_core: 0.00003942
+    usd_per_sec_gib: 0.00000667
+    utilization_cases: [1.0, 0.3]   # cost per 1,000 requests if the GPU is busy this share of the time
+    # Weights and vLLM flags per variant. Variant names are also Modal app suffixes.
+    variants:
+      bf16:
+        weights: Qwen/Qwen2.5-7B-Instruct
+        args: []
+      fp8:                    # pre-quantized with llm-compressor (FP8 weights, dynamic per-token activations)
+        weights: RedHatAI/Qwen2.5-7B-Instruct-FP8-dynamic
+        args: []
+      bf16-nocache:
+        weights: Qwen/Qwen2.5-7B-Instruct
+        args: ["--no-enable-prefix-caching"]
+
+budget_usd: 8.0   # one ledger for the repo (results/spend.jsonl); a phase does not start past this

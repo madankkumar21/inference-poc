@@ -1,0 +1,3 @@
+{"provider": "modal_vllm", "variant": "bf16", "rtt_s": 0.32746300008147955}
+{"provider": "modal_vllm", "variant": "fp8", "rtt_s": 0.059089665999636054}
+{"provider": "modal_vllm", "variant": "bf16-nocache", "rtt_s": 0.03935916698537767}

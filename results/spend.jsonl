@@ -1,0 +1,6 @@
+{"run_id": "smoke", "phase": "smoke", "usd": 0.0822, "note": "container-seconds, upper bound"}
+{"run_id": "final", "phase": "bf16", "usd": 0.5416, "note": "first container, container-seconds upper bound"}
+{"run_id": "final", "phase": "bf16", "usd": 0.0495, "note": "container-seconds, upper bound"}
+{"run_id": "final", "phase": "fp8", "usd": 0.4915, "note": "container-seconds, upper bound"}
+{"run_id": "final", "phase": "nocache", "usd": 0.0708, "note": "container-seconds, upper bound"}
+{"run_id": "final", "phase": "nocache", "usd": 0.1021, "note": "container-seconds, upper bound"}
