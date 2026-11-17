@@ -1,6 +1,6 @@
 model:
   served_name: Qwen/Qwen2.5-7B-Instruct
-  together_id: Qwen/Qwen2.5-7B-Instruct-Turbo
+  together_id: Qwen/Qwen3.5-9B
 slo:
   ttft_s: 1.0
   e2e_s: 15.0
@@ -36,8 +36,11 @@ min_n_for_p95: 100
 providers:
   together:
     base_url: https://api.together.xyz/v1
-    usd_per_m_input: 0.3
-    usd_per_m_output: 0.3
+    usd_per_m_input: 0.17
+    usd_per_m_output: 0.25
+    extra_body:
+      reasoning:
+        enabled: false
   modal_vllm:
     gpu: L40S
     cpu_cores: 2

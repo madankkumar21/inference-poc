@@ -45,6 +45,7 @@ class Together(Provider):
             base_url=self.cfg["base_url"],
             model=self.model_id,
             headers=self._headers(),
+            extra_body=dict(self.cfg.get("extra_body") or {}),
         )
 
     def run_cost_usd(self, rows: list[dict], billed_seconds: float = 0.0) -> float:

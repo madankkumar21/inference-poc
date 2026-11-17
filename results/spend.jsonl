@@ -4,3 +4,5 @@
 {"run_id": "final", "phase": "fp8", "usd": 0.4915, "note": "container-seconds, upper bound"}
 {"run_id": "final", "phase": "nocache", "usd": 0.0708, "note": "container-seconds, upper bound"}
 {"run_id": "final", "phase": "nocache", "usd": 0.1021, "note": "container-seconds, upper bound"}
+{"run_id": "final", "phase": "together", "usd": 0.6789, "note": "first attempt 2026-11-16, tokens at posted price from saved rows; excludes an open-loop burst that saved no rows (harness bug)"}
+{"run_id": "final", "phase": "together", "usd": 1.4804, "note": "tokens at posted price (sweeps only)"}

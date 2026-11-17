@@ -114,7 +114,10 @@ class Run:
             rows, window = asyncio.run(closed_loop(ep, mk, c, w["output_tokens"], w["duration_s"], {"workload": "chat"}))
             after = read_metrics(ep.metrics_url)
             s = self.save_level(ep, "chat", rows, window, {"concurrency": c}, before, after)
-            peak = max(peak, s["req_s"])
+            if window < 0.5 * w["duration_s"]:   # most of the level was warm-up: the rate is not usable
+                print(f"    level c={c} ignored for the peak: measured window {window:.1f} s")
+            else:
+                peak = max(peak, s["req_s"])
             guard(rows)
         self.peak_req_s[ep.variant] = peak
 

@@ -26,6 +26,10 @@ import httpx
 from providers.base import Endpoint
 
 TIMEOUT = httpx.Timeout(connect=30, read=600, write=60, pool=600)
+# One request may not take longer than this from send to last token. A request that does is an error,
+# not a sample. No self-hosted request came near it (slowest: 28 s); Together stalled a few for 53-145 s,
+# and a closed-loop level waits for its last worker, so one stall stretched the whole level.
+REQUEST_DEADLINE_S = 60.0
 
 
 def _itl_stats(chunk_times: list[float]) -> tuple[float | None, float | None, float | None]:
@@ -59,33 +63,36 @@ async def one_request(client: httpx.AsyncClient, ep: Endpoint, prompt: str, max_
     text: list[str] = []
     err = None
     try:
-        async with client.stream("POST", f"{ep.base_url}/chat/completions", json=body,
-                                 headers=ep.headers, timeout=TIMEOUT) as r:
-            if r.status_code != 200:
-                err = f"http {r.status_code}: {(await r.aread())[:300]!r}"
-            else:
-                async for line in r.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    obj = json.loads(data)
-                    if obj.get("error"):
-                        err = f"stream error: {json.dumps(obj['error'])[:300]}"
-                        break
-                    if obj.get("usage"):
-                        usage = obj["usage"]
-                    for ch in obj.get("choices") or []:
-                        delta = ch.get("delta") or {}
-                        if delta.get("content"):
-                            now = time.perf_counter()
-                            if ttft is None:
-                                ttft = now - t0
-                            chunk_times.append(now)
-                            text.append(delta["content"])
-                        if ch.get("finish_reason"):
-                            finish = ch["finish_reason"]
+        async with asyncio.timeout(REQUEST_DEADLINE_S):
+            async with client.stream("POST", f"{ep.base_url}/chat/completions", json=body,
+                                     headers=ep.headers, timeout=TIMEOUT) as r:
+                if r.status_code != 200:
+                    err = f"http {r.status_code}: {(await r.aread())[:300]!r}"
+                else:
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        obj = json.loads(data)
+                        if obj.get("error"):
+                            err = f"stream error: {json.dumps(obj['error'])[:300]}"
+                            break
+                        if obj.get("usage"):
+                            usage = obj["usage"]
+                        for ch in obj.get("choices") or []:
+                            delta = ch.get("delta") or {}
+                            if delta.get("content"):
+                                now = time.perf_counter()
+                                if ttft is None:
+                                    ttft = now - t0
+                                chunk_times.append(now)
+                                text.append(delta["content"])
+                            if ch.get("finish_reason"):
+                                finish = ch["finish_reason"]
+    except TimeoutError:
+        err = f"deadline: no complete response in {REQUEST_DEADLINE_S:.0f} s"
     except Exception as e:   # recorded, not raised: an error rate is a result
         err = repr(e)
     e2e = time.perf_counter() - t0
@@ -112,6 +119,10 @@ def _client(concurrency: int) -> httpx.AsyncClient:
     return httpx.AsyncClient(limits=lim)
 
 
+# A paid endpoint must never see an arrival rate computed from a bad measurement.
+MAX_OPEN_LOOP_RPS = 100.0
+
+
 async def closed_loop(ep: Endpoint, make_prompt: Callable[[int], str], concurrency: int, max_tokens: int,
                       duration_s: float, tag: dict) -> tuple[list[dict], float]:
     """`concurrency` workers for `duration_s`. Prompt i is make_prompt(i), so every arm gets the same prompts.
@@ -136,13 +147,29 @@ async def closed_loop(ep: Endpoint, make_prompt: Callable[[int], str], concurren
 
         await asyncio.gather(*(worker(w) for w in range(concurrency)))
         t_end = time.perf_counter()
-    window = t_end - (max(warm_done) if warm_done else t_start)
-    return rows, max(window, 1e-9)
+    return rows, measured_window(t_start, t_end, warm_done)
+
+
+def measured_window(t_start: float, t_end: float, warm_done: list[float]) -> float:
+    """Seconds from the end of the first wave to the end of the level.
+
+    The first wave ends when 90% of workers have finished their first request. Waiting for every
+    worker let one stalled first request shrink the window to almost nothing, which turned the
+    request rate into a number in the millions (Together run, 2026-11-16: a few requests took 145 s
+    while most took 1.5 s). Up to 9 workers this is the same as waiting for all of them."""
+    if not warm_done:
+        return max(t_end - t_start, 1e-9)
+    done = sorted(warm_done)
+    k = max(0, -(-len(done) * 9 // 10) - 1)   # index of the 90th percentile, rounded up
+    return max(t_end - done[k], 1e-9)
 
 
 async def open_loop(ep: Endpoint, make_prompt: Callable[[int], str], rate_rps: float, max_tokens: int,
                     duration_s: float, tag: dict, seed: int = 0) -> tuple[list[dict], float]:
     """Poisson arrivals at `rate_rps` for `duration_s`; waits for every request to finish."""
+    if not 0 < rate_rps <= MAX_OPEN_LOOP_RPS:
+        raise ValueError(f"open-loop rate {rate_rps:.1f} req/s is outside 0-{MAX_OPEN_LOOP_RPS}; "
+                         "the closed-loop peak it came from is wrong")
     rng = random.Random(seed)
     tasks = []
     async with _client(512) as client:
@@ -176,7 +203,9 @@ async def _rtt(url: str, headers: dict, n: int) -> list[float]:
 
 def rtt(ep: Endpoint, n: int = 7) -> float:
     """Median round trip of a cheap GET on a warm connection: the network share of every TTFT."""
-    url = ep.metrics_url.replace("/metrics", "/health") if ep.metrics_url else f"{ep.base_url}/models"
+    # No health route on a hosted API: use a path that returns a small 404. GET /models is the wrong probe,
+    # because Together's list is a 436 KB download (it read 232 ms and then 1,914 ms on the same day).
+    url = ep.metrics_url.replace("/metrics", "/health") if ep.metrics_url else f"{ep.base_url}/rtt-probe"
     try:
         return statistics.median(asyncio.run(_rtt(url, ep.headers, n)))
     except httpx.HTTPError as e:   # a diagnostic only: a slow network must not end a paid phase

@@ -146,7 +146,9 @@ def test_costs_per_1k_requests():
     assert per_s == pytest.approx(0.000542 + 2 * 0.00003942 + 24 * 0.00000667)
     assert m.usd_per_1k_requests(2.0, 1.0) == pytest.approx(per_s / 2 * 1000)
     assert m.usd_per_1k_requests(2.0, 0.3) == pytest.approx(per_s / 0.6 * 1000)
-    assert t.usd_per_1k_requests(1000, 250) == pytest.approx(1000 * 1250 * 0.30 / 1e6)
+    tc = cfg["providers"]["together"]   # input and output are priced separately
+    assert t.usd_per_1k_requests(1000, 250) == pytest.approx(
+        1000 * (1000 * tc["usd_per_m_input"] + 250 * tc["usd_per_m_output"]) / 1e6)
 
 
 def test_quality_items_have_known_answers(server):
@@ -192,3 +194,40 @@ def test_end_to_end_runner_and_report(server, tmp_path, monkeypatch):
     assert "5/5" in md
     levels = [json.loads(x) for x in (tmp_path / "results" / "t" / "levels.jsonl").read_text().splitlines()]
     assert {lv["workload"] for lv in levels} == {"chat", "long_context", "open_loop"}
+
+
+
+def test_measured_window_ignores_a_stalled_first_request():
+    from bench.load import measured_window
+    # 64 workers: 63 finish warm-up at t=2 s, one stalls until the level ends at t=60 s.
+    assert measured_window(0.0, 60.0, [2.0] * 63 + [60.0]) == pytest.approx(58.0)
+    # Few workers: same as waiting for all of them.
+    assert measured_window(0.0, 60.0, [1.0, 2.0, 3.0, 4.0]) == pytest.approx(56.0)
+    assert measured_window(0.0, 60.0, []) == pytest.approx(60.0)
+
+
+def test_open_loop_refuses_an_absurd_rate():
+    import asyncio
+    from bench.load import open_loop
+    from providers.base import Endpoint
+    ep = Endpoint("x", "y", "http://127.0.0.1:1/v1", "m", {})
+    with pytest.raises(ValueError):
+        asyncio.run(open_loop(ep, lambda i: "p", 5_500_000.0, 8, 1.0, {}))
+
+
+def test_a_request_past_the_deadline_is_an_error(monkeypatch):
+    import httpx
+    from bench import load
+    st = fake_server.State(ttft=0.6, tpot=0.002, queue_per_inflight=0.0)
+    srv, url = fake_server.start(st)
+    monkeypatch.setattr(load, "REQUEST_DEADLINE_S", 0.2)
+
+    async def go():
+        async with httpx.AsyncClient() as c:
+            return await load.one_request(c, ep_for(url), "hello", 8, {"workload": "chat"})
+    try:
+        r = asyncio.run(go())
+    finally:
+        srv.shutdown()
+    assert r["error"].startswith("deadline")
+    assert r["e2e_s"] < 0.5

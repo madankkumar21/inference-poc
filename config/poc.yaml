@@ -3,7 +3,9 @@
 
 model:
   served_name: Qwen/Qwen2.5-7B-Instruct          # the name clients send to the self-hosted server, every variant
-  together_id: Qwen/Qwen2.5-7B-Instruct-Turbo    # checked against GET /v1/models before any Together request
+  # 2026-11-16: Together lists Qwen2.5-7B-Instruct-Turbo but no longer serves it serverless (dedicated only).
+  # Qwen3.5-9B is the closest small Qwen it serves serverless, so the Together arm is a different, newer model.
+  together_id: Qwen/Qwen3.5-9B                   # checked against GET /v1/models before any Together request
 
 # Service-level targets for goodput: the share of requests that meet both.
 slo:
@@ -35,8 +37,10 @@ min_n_for_p95: 100            # below this the report shows p95 as "n<100"
 providers:
   together:
     base_url: https://api.together.xyz/v1
-    usd_per_m_input: 0.30     # pricing page, 2026-11-13: "Qwen2.5 7B Instruct Turbo $0.30 $0.30"
-    usd_per_m_output: 0.30
+    usd_per_m_input: 0.17     # GET /v1/models, 2026-11-16: Qwen/Qwen3.5-9B input 0.17, output 0.25
+    usd_per_m_output: 0.25
+    extra_body:               # Qwen3.5 thinks by default; off, so first token and output length compare with the 7B arms
+      reasoning: {enabled: false}
   modal_vllm:
     gpu: L40S
     cpu_cores: 2

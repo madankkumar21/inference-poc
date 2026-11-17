@@ -1,3 +1,4 @@
 {"provider": "modal_vllm", "variant": "bf16", "rtt_s": 0.32746300008147955}
 {"provider": "modal_vllm", "variant": "fp8", "rtt_s": 0.059089665999636054}
 {"provider": "modal_vllm", "variant": "bf16-nocache", "rtt_s": 0.03935916698537767}
+{"provider": "together", "variant": "serverless", "rtt_s": 0.1344456251244992, "note": "re-measured after the run with a small 404 probe; the run's own GET /models probe read 1.914 s"}
