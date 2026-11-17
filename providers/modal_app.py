@@ -13,6 +13,7 @@ This file imports nothing from the repo: Modal ships it to the container on its 
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -25,24 +26,35 @@ import modal
 VARIANT = os.environ.get("POC_VARIANT", "bf16")
 SERVED_NAME = os.environ.get("POC_SERVED_NAME", "Qwen/Qwen2.5-7B-Instruct")   # what clients send
 WEIGHTS = os.environ.get("POC_WEIGHTS", SERVED_NAME)                         # what vLLM loads
-EXTRA_ARGS = json.loads(os.environ.get("POC_ARGS", "[]"))
+# Inside the container the args arrive base64-encoded: Modal's image env step drops the
+# backslashes in nested JSON such as '{"enable_thinking": false}'.
+if os.environ.get("POC_ARGS_B64"):
+    EXTRA_ARGS = json.loads(base64.b64decode(os.environ["POC_ARGS_B64"]).decode())
+else:
+    EXTRA_ARGS = json.loads(os.environ.get("POC_ARGS", "[]"))
 GPU = os.environ.get("POC_GPU", "L40S")
 CPU = float(os.environ.get("POC_CPU", "2"))
 MEMORY_MIB = int(float(os.environ.get("POC_MEMORY_GIB", "24")) * 1024)
 PORT = 8000
-MAX_MODEL_LEN = 12288   # 8K-token long-context prompts plus output, with headroom
-VLLM_VERSION = "0.11.0"
+MAX_MODEL_LEN = int(os.environ.get("POC_MAX_MODEL_LEN", "12288"))   # 8K-token prompts plus output, with headroom
+VLLM_VERSION = os.environ.get("POC_VLLM", "0.11.0")
+# The original arms pin transformers and huggingface_hub; newer vLLM releases resolve their own.
+TRANSFORMERS = os.environ.get("POC_TRANSFORMERS", "4.57.1" if VLLM_VERSION == "0.11.0" else "")
+PINS = [f"transformers=={TRANSFORMERS}", "huggingface_hub>=0.34,<1"] if TRANSFORMERS else []
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
-    .uv_pip_install(f"vllm=={VLLM_VERSION}", "transformers==4.57.1", "huggingface_hub>=0.34,<1")
+    .uv_pip_install(f"vllm=={VLLM_VERSION}", *PINS)
     .env({
         "POC_VARIANT": VARIANT,
         "POC_SERVED_NAME": SERVED_NAME,
         "POC_WEIGHTS": WEIGHTS,
-        "POC_ARGS": json.dumps(EXTRA_ARGS),
+        "POC_ARGS_B64": base64.b64encode(json.dumps(EXTRA_ARGS).encode()).decode(),
         "POC_GPU": GPU,
+        "POC_VLLM": VLLM_VERSION,
+        "POC_TRANSFORMERS": TRANSFORMERS,
+        "POC_MAX_MODEL_LEN": str(MAX_MODEL_LEN),
         "HF_HOME": "/cache/hf",
         "VLLM_LOGGING_LEVEL": "INFO",
     })

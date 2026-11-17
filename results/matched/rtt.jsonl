@@ -1,0 +1,5 @@
+{"provider": "modal_vllm", "variant": "h100-q35-fp8", "rtt_s": 0.11083166603930295}
+{"provider": "modal_vllm", "variant": "h100-q35-fp8-mtp", "rtt_s": 0.11301866616122425}
+{"provider": "together_dedicated", "variant": "h100-fp8", "rtt_s": 0.12508037500083447}
+{"provider": "modal_vllm", "variant": "l40s-q35-bf16", "rtt_s": 0.23053999990224838}
+{"provider": "together_dedicated", "variant": "h100-bf16", "rtt_s": 0.12783033400774002}

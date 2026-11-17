@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from providers.modal_vllm import ModalVLLM   # noqa: E402
 from providers.together import Together       # noqa: E402
+from providers.together_dedicated import TogetherDedicated   # noqa: E402
 
 
 def read(path: Path) -> list[dict]:
@@ -49,7 +50,7 @@ def cost_cells(lv: dict, pricer: dict, util_cases: list[float]) -> str:
     if lv["provider"] == "together":
         c = p.usd_per_1k_requests(lv["prompt_tokens_mean"], lv["completion_tokens_mean"])
         return " / ".join([num(c, "${:.3f}")] * len(util_cases)) + " (posted price)"
-    return " / ".join(num(p.usd_per_1k_requests(lv["req_s"], u), "${:.3f}") for u in util_cases)
+    return " / ".join(num(p.usd_per_1k_requests(lv["req_s"], u, lv["variant"]), "${:.3f}") for u in util_cases)
 
 
 def checks(levels: list[dict], rtts: dict) -> list[str]:
@@ -124,11 +125,14 @@ def main(run_id: str) -> None:
     slo = cfg["slo"]
     pricer = {"modal_vllm": ModalVLLM(mcfg, cfg["model"]["served_name"]),
               "together": Together(cfg["providers"]["together"], cfg["model"]["together_id"])}
+    if cfg["providers"].get("together_dedicated"):
+        pricer["together_dedicated"] = TogetherDedicated(cfg["providers"]["together_dedicated"])
     rtts = {(r["provider"], r["variant"]): r["rtt_s"] for r in rtt_rows}
 
     out = [f"# Run {run_id}", "",
-           f"Self-hosted: vLLM on one Modal {mcfg['gpu']}, weights per variant in `config/poc.yaml`. "
-           f"Together: `{cfg['model']['together_id']}` on its shared serverless fleet.",
+           "Self-hosted: vLLM on one Modal GPU; GPU, weights and vLLM version per variant in `config/poc.yaml`. "
+           f"together: `{cfg['model']['together_id']}` on its shared serverless fleet. "
+           "together_dedicated: one replica of a Together dedicated endpoint, one GPU.",
            f"Goodput: share of measured requests with TTFT ≤ {slo['ttft_s']} s and end-to-end ≤ {slo['e2e_s']} s. "
            f"p95 is shown only when n ≥ {n_min}. Goodput uses client TTFT, so it includes the network path "
            f"from the test machine; compare server TTFT for GPU-side latency.", ""]
@@ -137,12 +141,15 @@ def main(run_id: str) -> None:
                 + "; ".join(f"{p}/{v} {ms(r)} ms" for (p, v), r in rtts.items())
                 + ". Client TTFT includes this.", ""]
 
-    sections = [("chat", "Chat: closed loop, about {i:,} tokens in, {o} out", [("Conc.", "concurrency")]),
+    chat_keys = [("Conc.", "concurrency")] + ([("Run", "repeat")] if any(lv.get("repeat") for lv in levels) else [])
+    sections = [("chat", "Chat: closed loop, about {i:,} tokens in, {o} out", chat_keys),
+                ("natural", "Natural prose: short questions, {o} tokens out (speculator-friendly text)", [("Conc.", "concurrency")]),
                 ("long_context", "Long context: one shared document, about {i:,} tokens in, {o} out", [("Conc.", "concurrency")]),
                 ("open_loop", "Open loop: Poisson arrivals at a share of each arm's closed-loop peak", [("Load", "load_fraction"), ("Rate req/s", "rate_rps")])]
     for wl, title, keys in sections:
         rows = sorted([lv for lv in levels if lv["workload"] == wl],
-                      key=lambda x: (x["provider"], x["variant"], x.get("concurrency") or x.get("load_fraction") or 0))
+                      key=lambda x: (x["provider"], x["variant"], x.get("repeat") or 0,
+                                     x.get("concurrency") or x.get("load_fraction") or 0))
         if not rows:
             continue
         w = cfg["workloads"][wl]
@@ -157,20 +164,27 @@ def main(run_id: str) -> None:
         for (p, v), qs in arms.items():
             out.append(f"| {p} | {v} | {sum(q['correct'] for q in qs)}/{len(qs)} |")
         out.append("")
-        base = {q["i"]: (q.get("text") or "").strip() for q in arms.get(("modal_vllm", "bf16"), [])}
+        ref = tuple((cfg.get("matched") or {}).get("quality_reference") or ("modal_vllm", "bf16"))
+        if ref not in arms:
+            ref = ("modal_vllm", "bf16")
+        base = {q["i"]: (q.get("text") or "").strip() for q in arms.get(ref, [])}
         for (p, v), qs in arms.items():
-            if base and (p, v) != ("modal_vllm", "bf16"):
+            if base and (p, v) != ref:
                 same = sum(base.get(q["i"]) == (q.get("text") or "").strip() for q in qs)
-                out.append(f"- {p}/{v} gives the same answer as bf16 on {same}/{len(qs)} questions.")
-        out += ["", "Two-digit multiplication answered with the number only is hard for a 7B model, so exact "
-                "scores are low on every arm. The test cannot separate small quality changes at n=50; "
-                "agreement with bf16 is the more direct check on quantization.", ""]
+                out.append(f"- {p}/{v} gives the same answer as {ref[0]}/{ref[1]} on {same}/{len(qs)} questions.")
+        out += ["", "Multiplication answered with the number only is hard for a small model, so exact scores are "
+                "low on every arm. A test this small cannot separate small quality changes; agreement with the "
+                "full-precision reference is the more direct check on quantization.", ""]
 
     if colds:
         out += ["## Cold starts (one observation each)", "",
                 "| Label | GPU | vLLM | Total to first token s | Schedule + boot s | Weights + engine s | First request TTFT ms |",
                 "|---|---|---|---|---|---|---|"]
         for c in colds:
+            if "request_to_ready_s" in c:   # Together dedicated: deployment request to READY
+                out.append(f"| {c['label']} | Together H100 | n/a | {num(c['request_to_ready_s'], '{:.1f}')} "
+                           "(request to READY) | n/a | n/a | n/a |")
+                continue
             out.append(f"| {c['label']} | {c.get('gpu', 'n/a')} | {c.get('vllm', 'n/a')} | "
                        f"{num(c['total_to_first_token_s'], '{:.1f}')} | {num(c.get('schedule_and_boot_s'), '{:.1f}')} | "
                        f"{num(c.get('weights_and_engine_s'), '{:.1f}')} | {ms(c['first_request_ttft_s'])} |")
@@ -182,10 +196,17 @@ def main(run_id: str) -> None:
     out += ["## Spend for this run", "", "| Phase | USD | Basis |", "|---|---|---|"]
     out += [f"| {s['phase']} | {s['usd']:.3f} | {s['note']} |" for s in spend]
     out += [f"| **Total** | **{sum(s['usd'] for s in spend):.2f}** | |", ""]
-    out += ["How to read cost: self-hosted cost per 1,000 requests is the container price divided by the measured "
-            "request rate, at the share of time the GPU is busy. Together's is its posted input and output price "
-            "at the measured token counts, and does not depend on load. Together's throughput is what this client "
-            "saw on a shared fleet with rate limits, not the capacity of one GPU.", ""]
+    provs = {r["provider"] for r in levels}
+    note = ["How to read cost: a per-GPU arm's cost per 1,000 requests is its hourly price divided by the measured "
+            "request rate, at the share of time the GPU is busy."]
+    if "together_dedicated" in provs:
+        note.append("Together dedicated uses its posted price per GPU hour, so it is priced the same way as the "
+                    "Modal containers.")
+    if "together" in provs:
+        note.append("Together serverless uses its posted input and output price at the measured token counts, "
+                    "and does not depend on load. Its throughput is what this client saw on a shared fleet with "
+                    "rate limits, not the capacity of one GPU.")
+    out += [" ".join(note), ""]
     (d / "summary.md").write_text("\n".join(out))
     print("\n".join(out))
 

@@ -75,3 +75,35 @@ def calibrate(sent_words: int, prompt_tokens: int, overhead_tokens: int = 60) ->
     if sent_words <= 0 or prompt_tokens <= overhead_tokens:
         return DEFAULT_TOKENS_PER_WORD
     return (prompt_tokens - overhead_tokens) / sent_words
+
+
+# Natural-language requests, for speculative decoding: a speculator guesses the next tokens, and it
+# guesses ordinary prose far better than the random-word reports above. Short input, 250 tokens out.
+NATURAL_TOPICS = (
+    "how DNS resolves a domain name", "how a TCP connection is opened and closed", "how a hash table handles collisions",
+    "how HTTPS keeps a connection private", "how a database index speeds up a query", "how garbage collection works",
+    "how a load balancer chooses a server", "how a CPU cache reduces memory latency", "how public-key encryption works",
+    "how a compiler turns source code into machine code", "how version control tracks changes", "how a refrigerator keeps food cold",
+    "how vaccines train the immune system", "how a bicycle stays upright", "how compound interest grows savings",
+    "how a jet engine produces thrust", "how photosynthesis stores energy", "how a credit score is calculated",
+    "how GPS finds your position", "how noise-cancelling headphones work", "how a bill becomes a law in the United States",
+    "how a heat pump warms a house", "how bread rises", "how an electric car battery is charged",
+    "how a search engine ranks pages", "how a transformer language model predicts the next word", "how tides happen",
+    "how a mortgage is paid down over time", "how a camera sensor captures light", "how a recommendation system picks items",
+    "how a blood test measures cholesterol", "how a solar panel makes electricity", "how a container differs from a virtual machine",
+    "how weather forecasts are made", "how a password is stored safely", "how an elevator knows where to stop",
+    "how a supply chain moves goods from a factory to a store", "how a Wi-Fi router shares one connection", "how coffee is decaffeinated",
+    "how a spreadsheet recalculates formulas",
+)
+NATURAL_STYLES = (
+    "Explain {t} to a curious high-school student. Use plain English, one everyday example, and short paragraphs.",
+    "Write a clear, friendly explanation of {t} for a new employee. Cover the main steps in order.",
+    "Describe {t}. Start with the big picture, then walk through what happens step by step, then give one common misconception.",
+)
+
+
+def natural_prompt(i: int) -> str:
+    """Request i: one of 40 topics in one of 3 styles (120 distinct prompts, then they repeat)."""
+    t = NATURAL_TOPICS[i % len(NATURAL_TOPICS)]
+    s = NATURAL_STYLES[(i // len(NATURAL_TOPICS)) % len(NATURAL_STYLES)]
+    return s.format(t=t)

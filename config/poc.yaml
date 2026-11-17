@@ -29,8 +29,21 @@ workloads:
     output_tokens: 250
     load_fractions: [0.5, 0.8]
     duration_s: 60
-  quality:                    # 50 fixed arithmetic questions at temperature 0; accuracy per arm
-    n: 50
+  quality:                    # fixed arithmetic questions at temperature 0; the first 50 match earlier runs
+    n: 200                    # 50 in run "final"; 200 from the matched run on
+  natural:                    # ordinary prose requests (bench/prompts.py), so a speculator sees predictable text
+    input_tokens: 40          # approximate; the prompts are short questions
+    output_tokens: 250
+    concurrency: [1, 16]
+    duration_s: 60
+
+# The matched comparison: Qwen3.5-9B on one H100, Modal vLLM against a Together dedicated endpoint.
+matched:
+  levels: [1, 4, 16, 64]      # closed-loop chat levels for every matched arm
+  repeat_levels: [1, 16]      # run a second time on the same endpoint, for run-to-run spread
+  phase_minutes: 40           # wall-clock stop for any paid phase, checked after each level
+  health_timeout_min: 15      # a crash-looping container bills until this; a first H100 start is well under it
+  quality_reference: [modal_vllm, l40s-q35-bf16]   # agreement in the report is measured against this arm
 
 min_n_for_p95: 100            # below this the report shows p95 as "n<100"
 
@@ -41,6 +54,28 @@ providers:
     usd_per_m_output: 0.25
     extra_body:               # Qwen3.5 thinks by default; off, so first token and output length compare with the 7B arms
       reasoning: {enabled: false}
+  together_dedicated:
+    # Together v2 dedicated endpoints. docs.together.ai/docs/dedicated-inference, together.ai/pricing, 2026-11-16:
+    # $5.49 per H100 per hour, billed per minute while a deployment runs.
+    base_url: https://api.together.xyz/v1
+    usd_per_gpu_hour: 5.49
+    scale_to_zero_s: 600        # Together stops the deployment after 10 idle minutes, if this process dies
+    inactive_timeout_min: 30    # a second idle stop; 30 is the minimum Together accepts
+    ready_timeout_s: 1800
+    stop_timeout_s: 600
+    extra_body:
+      reasoning: {enabled: false}
+    # GET /v2/supported-models?search=qwen3.5-9b, 2026-11-16. Both 1x H100 configs list
+    # optimization=balanced and speculator_enabled=false; no config for this model has a speculator.
+    variants:
+      h100-fp8:
+        model: projects/proj_CbGpV8orZSw72BARMZy4i/models/ml_Cbuqh6mfYmt2AHL5kzDb7    # Qwen/Qwen3.5-9B-FP8
+        config: projects/proj_CbGpV8orZSw72BARMZy4i/configs/cr_Cggnup6comZCBwzTyBJkV
+        gpu_count: 1
+      h100-bf16:
+        model: projects/proj_CbGpV8orZSw72BARMZy4i/models/ml_CbuqU8KKAtoGrowco4nqK    # Qwen/Qwen3.5-9B-BF16
+        config: projects/proj_CbGpV8orZSw72BARMZy4i/configs/cr_CggnumBWbnG8WMfoAm31y
+        gpu_count: 1
   modal_vllm:
     gpu: L40S
     cpu_cores: 2
@@ -61,5 +96,35 @@ providers:
       bf16-nocache:
         weights: Qwen/Qwen2.5-7B-Instruct
         args: ["--no-enable-prefix-caching"]
+      # Matched comparison. Qwen3.5 needs vLLM >= 0.17 (recipes.vllm.ai/Qwen/Qwen3.5-9B). "H100!" stops Modal
+      # from upgrading the request to an H200. modal.com/pricing, 2026-11-16: H100 $0.001097 per second.
+      # min_tokens is off, as on Together, so every arm ends where the model would end.
+      h100-q35-fp8:
+        weights: RedHatAI/Qwen3.5-9B-FP8-dynamic     # keeps the model's MTP layer, which m2 uses
+        served_name: Qwen/Qwen3.5-9B
+        gpu: "H100!"
+        usd_per_sec_gpu: 0.001097
+        cpu_cores: 4
+        memory_gib: 32
+        vllm: "0.18.1"
+        min_tokens: false
+        args: ["--tokenizer", "Qwen/Qwen3.5-9B", "--language-model-only", "--default-chat-template-kwargs", "{\"enable_thinking\": false}"]
+      h100-q35-fp8-mtp:
+        weights: RedHatAI/Qwen3.5-9B-FP8-dynamic
+        served_name: Qwen/Qwen3.5-9B
+        gpu: "H100!"
+        usd_per_sec_gpu: 0.001097
+        cpu_cores: 4
+        memory_gib: 32
+        vllm: "0.18.1"
+        min_tokens: false
+        args: ["--tokenizer", "Qwen/Qwen3.5-9B", "--language-model-only", "--default-chat-template-kwargs", "{\"enable_thinking\": false}",
+               "--speculative-config", "{\"method\": \"mtp\", \"num_speculative_tokens\": 1}"]
+      l40s-q35-bf16:                                 # full-precision reference: quality questions only
+        weights: Qwen/Qwen3.5-9B
+        served_name: Qwen/Qwen3.5-9B
+        vllm: "0.18.1"
+        min_tokens: false
+        args: ["--language-model-only", "--default-chat-template-kwargs", "{\"enable_thinking\": false}"]
 
-budget_usd: 8.0   # one ledger for the repo (results/spend.jsonl); a phase does not start past this
+budget_usd: 14.0  # one ledger for the repo (results/spend.jsonl); a phase does not start past this. $8 until 2026-11-16

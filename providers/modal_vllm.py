@@ -40,23 +40,35 @@ class ModalVLLM(Provider):
         self.cfg = cfg
         self.served_name = served_name
 
+    # Settings a variant may override; anything it leaves out comes from the provider block.
+    PER_VARIANT = ("gpu", "cpu_cores", "memory_gib", "usd_per_sec_gpu", "vllm", "transformers",
+                   "max_model_len", "served_name", "min_tokens")
+
     def variant_cfg(self, variant: str) -> dict:
         try:
-            return self.cfg["variants"][variant]
+            v = dict(self.cfg["variants"][variant])
         except KeyError:
             raise SystemExit(f"unknown variant {variant!r}; config has {sorted(self.cfg['variants'])}")
+        for k in self.PER_VARIANT:
+            v.setdefault(k, self.cfg.get(k))
+        v["served_name"] = v["served_name"] or self.served_name
+        v["min_tokens"] = True if v["min_tokens"] is None else v["min_tokens"]
+        return v
 
     def _env(self, variant: str) -> dict:
         v = self.variant_cfg(variant)
         env = dict(os.environ)
         env.update({
             "POC_VARIANT": variant,
-            "POC_SERVED_NAME": self.served_name,
+            "POC_SERVED_NAME": v["served_name"],
             "POC_WEIGHTS": v["weights"],
             "POC_ARGS": json.dumps(v["args"]),
-            "POC_GPU": self.cfg["gpu"],
-            "POC_CPU": str(self.cfg["cpu_cores"]),
-            "POC_MEMORY_GIB": str(self.cfg["memory_gib"]),
+            "POC_GPU": str(v["gpu"]),
+            "POC_CPU": str(v["cpu_cores"]),
+            "POC_MEMORY_GIB": str(v["memory_gib"]),
+            "POC_VLLM": str(v["vllm"] or "0.11.0"),
+            "POC_TRANSFORMERS": str(v["transformers"] or ""),
+            "POC_MAX_MODEL_LEN": str(v["max_model_len"] or 12288),
         })
         return env
 
@@ -79,10 +91,10 @@ class ModalVLLM(Provider):
             provider=self.name,
             variant=variant,
             base_url=f"{base}/v1",
-            model=self.served_name,
+            model=self.variant_cfg(variant)["served_name"],
             headers={"Authorization": f"Bearer {key}"},
             metrics_url=f"{base}/metrics",
-            honours_min_tokens=True,
+            honours_min_tokens=bool(self.variant_cfg(variant)["min_tokens"]),
         )
 
     def stop(self, variant: str) -> None:
@@ -102,18 +114,19 @@ class ModalVLLM(Provider):
         else:
             print(f"  stopped {name}")
 
-    def usd_per_sec(self) -> float:
-        c = self.cfg
+    def usd_per_sec(self, variant: str | None = None) -> float:
+        """Container price per second. Each variant carries its own GPU price: an H100 costs twice an L40S."""
+        c = self.variant_cfg(variant) if variant else self.cfg
         return (c["usd_per_sec_gpu"]
-                + c["cpu_cores"] * c["usd_per_sec_core"]
-                + c["memory_gib"] * c["usd_per_sec_gib"])
+                + c["cpu_cores"] * self.cfg["usd_per_sec_core"]
+                + c["memory_gib"] * self.cfg["usd_per_sec_gib"])
 
-    def run_cost_usd(self, rows: list[dict], billed_seconds: float) -> float:
+    def run_cost_usd(self, rows: list[dict], billed_seconds: float, variant: str | None = None) -> float:
         # Container-seconds from the first request to the stop: an upper bound on what Modal bills.
-        return billed_seconds * self.usd_per_sec()
+        return billed_seconds * self.usd_per_sec(variant)
 
-    def usd_per_1k_requests(self, req_per_s: float, utilization: float = 1.0) -> float:
+    def usd_per_1k_requests(self, req_per_s: float, utilization: float = 1.0, variant: str | None = None) -> float:
         """GPU cost per 1,000 requests at a measured request rate, if the GPU is busy `utilization` of the time."""
         if req_per_s <= 0 or utilization <= 0:
             return float("nan")
-        return self.usd_per_sec() / (req_per_s * utilization) * 1000
+        return self.usd_per_sec(variant) / (req_per_s * utilization) * 1000

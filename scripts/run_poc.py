@@ -10,6 +10,15 @@ Phases:
   fp8       pre-quantized FP8 checkpoint: cold start, quality, chat sweep, open loop
   nocache   bf16 with prefix caching off: long context only (the other half of the prefix-cache test)
 
+Matched comparison (2026-11-16): one model, Qwen3.5-9B, on one H100, run as --run-id matched.
+  m1        Modal H100, vLLM, FP8 weights, no speculator
+  m2        m1 plus vLLM's own speculative decoding (the model's MTP head)
+  t1        Together dedicated endpoint, 1x H100, FP8 profile
+  ref       Modal L40S, bf16 weights, quality questions only: the full-precision reference
+  tref      Together dedicated, 1x H100, bf16 profile, quality questions only
+
+Every paid phase first checks that nothing from an earlier run is still running (scripts/stop_all.py).
+
 Every Modal phase stops its app in a finally block and then checks Modal no longer lists it.
 Spend goes to one ledger for the repo (results/spend.jsonl), checked before each phase and after each level.
 """
@@ -38,7 +47,17 @@ from bench.stats import summarize                                               
 from providers.base import Endpoint                                               # noqa: E402
 
 # Rough spend per phase, used only for the check before a phase starts.
-EXPECTED_PHASE_USD = {"smoke": 0.4, "together": 3.0, "bf16": 1.5, "fp8": 0.8, "nocache": 0.4}
+EXPECTED_PHASE_USD = {"smoke": 0.4, "together": 3.0, "bf16": 1.5, "fp8": 0.8, "nocache": 0.4,
+                      "m1": 2.0, "m2": 1.5, "t1": 3.5, "ref": 0.4, "tref": 1.5}
+
+
+class WallClockStop(OverBudget):
+    """A paid phase ran past its time limit; stop at the next level boundary."""
+
+
+def default_leftovers(cfg: dict) -> list[str]:
+    from scripts.stop_all import leftovers
+    return leftovers(cfg)
 CALIBRATION = ROOT / "results" / "calibration.json"
 
 
@@ -60,6 +79,23 @@ class Run:
         self.ledger = Ledger(cfg["budget_usd"], ROOT / "results" / "spend.jsonl", run_id)
         (self.dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
         self.peak_req_s: dict[str, float] = {}
+        self.leftovers = default_leftovers   # replaced in tests
+
+    def require_clean(self, phase: str) -> None:
+        """Refuse to start a paid phase while anything from an earlier run is still running."""
+        left = self.leftovers(self.cfg)
+        if left:
+            raise OverBudget(f"{phase}: not starting while these still run: {left}. Run scripts/stop_all.py.")
+
+    def deadline_guard(self, phase: str, billed, minutes: float):
+        """The check after every level: budget, then wall clock."""
+        t_end = time.time() + minutes * 60
+
+        def guard(_rows):
+            self.ledger.check_running(phase, billed())
+            if time.time() > t_end:
+                raise WallClockStop(f"{phase}: past its {minutes:.0f}-minute limit; stopping")
+        return guard
 
     # ---------- shared steps ----------
     async def _one(self, ep, prompt, max_tokens, tag):
@@ -102,24 +138,52 @@ class Run:
             print(f"    errors: {s['error_samples']}")
         return s
 
-    def chat_sweep(self, ep: Endpoint, tpw: float, guard) -> None:
+    def chat_sweep(self, ep: Endpoint, tpw: float, guard, levels=None, repeat: int = 0) -> None:
         w = self.cfg["workloads"]["chat"]
-        levels = w["concurrency"]
-        if not ep.honours_min_tokens:   # serverless: stop where we would measure the rate limit
+        levels = list(levels or w["concurrency"])
+        if ep.shared_fleet:   # serverless: stop where we would measure the rate limit
             levels = [c for c in levels if c <= w["together_max_concurrency"]]
         peak = 0.0
         for c in levels:
             mk = lambda i, c=c: P.chat_prompt(w["input_tokens"], tpw, P.seed_for("chat", c, i))  # noqa: E731
             before = read_metrics(ep.metrics_url)
-            rows, window = asyncio.run(closed_loop(ep, mk, c, w["output_tokens"], w["duration_s"], {"workload": "chat"}))
+            rows, window = asyncio.run(closed_loop(ep, mk, c, w["output_tokens"], w["duration_s"],
+                                                   {"workload": "chat", "repeat": repeat}))
             after = read_metrics(ep.metrics_url)
-            s = self.save_level(ep, "chat", rows, window, {"concurrency": c}, before, after)
+            s = self.save_level(ep, "chat", rows, window, {"concurrency": c, "repeat": repeat}, before, after)
             if window < 0.5 * w["duration_s"]:   # most of the level was warm-up: the rate is not usable
                 print(f"    level c={c} ignored for the peak: measured window {window:.1f} s")
             else:
                 peak = max(peak, s["req_s"])
             guard(rows)
-        self.peak_req_s[ep.variant] = peak
+        if not repeat:
+            self.peak_req_s[ep.variant] = peak
+
+    def natural(self, ep: Endpoint, guard) -> None:
+        """Ordinary prose requests, so a speculator sees text it can predict."""
+        w = self.cfg["workloads"]["natural"]
+        for c in w["concurrency"]:
+            before = read_metrics(ep.metrics_url)
+            rows, window = asyncio.run(closed_loop(ep, P.natural_prompt, c, w["output_tokens"], w["duration_s"],
+                                                   {"workload": "natural"}))
+            after = read_metrics(ep.metrics_url)
+            self.save_level(ep, "natural", rows, window, {"concurrency": c}, before, after)
+            guard(rows)
+
+    def measure(self, ep: Endpoint, tpw: float, guard, steps: list[str], levels=None) -> None:
+        """The steps every arm of the matched comparison runs, in the same order."""
+        if "quality" in steps:
+            self.quality(ep)
+        if "chat" in steps:
+            self.chat_sweep(ep, tpw, guard, levels)
+        if "repeats" in steps:
+            self.chat_sweep(ep, tpw, guard, self.cfg["matched"]["repeat_levels"], repeat=1)
+        if "natural" in steps:
+            self.natural(ep, guard)
+        if "long_context" in steps:
+            self.long_context(ep, tpw, guard)
+        if "open_loop" in steps:
+            self.open_loop_runs(ep, tpw, guard)
 
     def long_context(self, ep: Endpoint, tpw: float, guard) -> None:
         w = self.cfg["workloads"]["long_context"]
@@ -177,7 +241,8 @@ class Run:
         """Time a request against a scaled-to-zero app: wait for /health, then time the first token."""
         base = ep.base_url.removesuffix("/v1")
         t_send = time.time()
-        deadline = t_send + 25 * 60
+        limit_min = self.cfg.get("matched", {}).get("health_timeout_min", 25)
+        deadline = t_send + limit_min * 60
         while True:
             try:
                 r = httpx.get(f"{base}/health", timeout=30, follow_redirects=True)
@@ -186,7 +251,7 @@ class Run:
             except httpx.HTTPError:
                 pass
             if time.time() > deadline:
-                raise RuntimeError("endpoint not healthy after 25 minutes")
+                raise RuntimeError(f"endpoint not healthy after {limit_min} minutes; check `modal app logs`")
             time.sleep(2)
         t_health = time.time()
         row = asyncio.run(self._one(ep, P.chat_prompt(1000, P.DEFAULT_TOKENS_PER_WORD, 4242), 32,
@@ -213,15 +278,15 @@ class Run:
               f"GPU {rec.get('gpu', '?')}, vLLM {rec.get('vllm', '?')})")
         return rec
 
-    def modal_phase(self, prov, phase: str, variant: str, steps: list[str]) -> None:
+    def modal_phase(self, prov, phase: str, variant: str, steps: list[str], levels=None) -> None:
         self.ledger.check(phase, EXPECTED_PHASE_USD[phase])
+        self.require_clean(phase)
         state = {"t_first": None}
 
         def billed() -> float:
-            return prov.run_cost_usd([], time.time() - state["t_first"]) if state["t_first"] else 0.0
+            return prov.run_cost_usd([], time.time() - state["t_first"], variant) if state["t_first"] else 0.0
 
-        def guard(_rows):
-            self.ledger.check_running(phase, billed())
+        guard = self.deadline_guard(phase, billed, self.cfg["matched"]["phase_minutes"])
 
         try:
             ep = prov.start(variant)
@@ -234,14 +299,7 @@ class Run:
                 return
             self.record_rtt(ep)
             tpw = self.tokens_per_word(ep)
-            if "quality" in steps:
-                self.quality(ep)
-            if "chat" in steps:
-                self.chat_sweep(ep, tpw, guard)
-            if "long_context" in steps:
-                self.long_context(ep, tpw, guard)
-            if "open_loop" in steps:
-                self.open_loop_runs(ep, tpw, guard)
+            self.measure(ep, tpw, guard, steps, levels)
             if "coldstart2" in steps:
                 prov.stop(variant)
                 self.ledger.add(phase, billed(), "first container, container-seconds upper bound")
@@ -254,6 +312,34 @@ class Run:
             prov.stop(variant)
             if state["t_first"] is not None:
                 self.ledger.add(phase, billed(), "container-seconds, upper bound")
+
+    def dedicated_phase(self, prov, phase: str, variant: str, steps: list[str], levels=None) -> None:
+        """Together dedicated endpoint: create, wait for READY, measure, and always stop and delete."""
+        self.ledger.check(phase, EXPECTED_PHASE_USD[phase])
+        self.require_clean(phase)
+        state = {"t0": None}
+
+        def billed() -> float:
+            return prov.run_cost_usd([], time.time() - state["t0"], variant) if state["t0"] else 0.0
+
+        guard = self.deadline_guard(phase, billed, self.cfg["matched"]["phase_minutes"])
+        try:
+            state["t0"] = time.time()   # from the request, so the ledger is an upper bound
+            ep = prov.start(variant)
+            ready = getattr(prov, "ready_at", {}).get(variant)
+            rec = {"provider": ep.provider, "variant": variant, "label": f"{variant}-create",
+                   "request_to_ready_s": (ready - state["t0"]) if ready else None}
+            jsonl(self.dir / "coldstarts.jsonl", rec)
+            print(f"  dedicated {variant}: READY after {rec['request_to_ready_s'] or float('nan'):.0f} s")
+            self.record_rtt(ep)
+            tpw = self.tokens_per_word(ep)
+            self.measure(ep, tpw, guard, steps, levels)
+        finally:
+            left = prov.stop(variant)
+            if state["t0"] is not None:
+                self.ledger.add(phase, billed(), "GPU-seconds from create request to stop, upper bound")
+            if left:
+                print(f"!! {phase}: Together still lists {left}; run scripts/stop_all.py now")
 
     def together_phase(self, prov) -> None:
         self.ledger.check("together", EXPECTED_PHASE_USD["together"])
@@ -290,8 +376,12 @@ def main() -> None:
 
     from providers.modal_vllm import ModalVLLM
     from providers.together import Together
+    from providers.together_dedicated import TogetherDedicated
     modal_p = ModalVLLM(cfg["providers"]["modal_vllm"], cfg["model"]["served_name"])
     together_p = Together(cfg["providers"]["together"], cfg["model"]["together_id"])
+    ded_p = TogetherDedicated(cfg["providers"]["together_dedicated"])
+    m = cfg["matched"]
+    matched = ["quality", "chat", "repeats", "natural", "long_context"]
 
     full = ["quality", "chat", "long_context", "open_loop"]
     plan = {
@@ -300,6 +390,11 @@ def main() -> None:
         "bf16": lambda: run.modal_phase(modal_p, "bf16", "bf16", full + ["coldstart2"]),
         "fp8": lambda: run.modal_phase(modal_p, "fp8", "fp8", ["quality", "chat", "open_loop"]),
         "nocache": lambda: run.modal_phase(modal_p, "nocache", "bf16-nocache", ["long_context"]),
+        "m1": lambda: run.modal_phase(modal_p, "m1", "h100-q35-fp8", matched, m["levels"]),
+        "m2": lambda: run.modal_phase(modal_p, "m2", "h100-q35-fp8-mtp", matched, m["levels"]),
+        "t1": lambda: run.dedicated_phase(ded_p, "t1", "h100-fp8", matched, m["levels"]),
+        "ref": lambda: run.modal_phase(modal_p, "ref", "l40s-q35-bf16", ["quality"]),
+        "tref": lambda: run.dedicated_phase(ded_p, "tref", "h100-bf16", ["quality"]),
     }
     for ph in args.phases.split(","):
         print(f"== phase {ph}")

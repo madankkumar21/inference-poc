@@ -1,6 +1,6 @@
 # Run final
 
-Self-hosted: vLLM on one Modal L40S, weights per variant in `config/poc.yaml`. Together: `Qwen/Qwen3.5-9B` on its shared serverless fleet.
+Self-hosted: vLLM on one Modal GPU; GPU, weights and vLLM version per variant in `config/poc.yaml`. together: `Qwen/Qwen3.5-9B` on its shared serverless fleet. together_dedicated: one replica of a Together dedicated endpoint, one GPU.
 Goodput: share of measured requests with TTFT ≤ 1.0 s and end-to-end ≤ 15.0 s. p95 is shown only when n ≥ 100. Goodput uses client TTFT, so it includes the network path from the test machine; compare server TTFT for GPU-side latency.
 
 Network round trip from the test machine (median of 7, warm connection): modal_vllm/bf16 327 ms; modal_vllm/fp8 59 ms; modal_vllm/bf16-nocache 39 ms; together/serverless 134 ms. Client TTFT includes this.
@@ -54,10 +54,10 @@ Network round trip from the test machine (median of 7, warm connection): modal_v
 | modal_vllm | fp8 | 19/50 |
 | together | serverless | 25/50 |
 
-- modal_vllm/fp8 gives the same answer as bf16 on 38/50 questions.
-- together/serverless gives the same answer as bf16 on 10/50 questions.
+- modal_vllm/fp8 gives the same answer as modal_vllm/bf16 on 38/50 questions.
+- together/serverless gives the same answer as modal_vllm/bf16 on 10/50 questions.
 
-Two-digit multiplication answered with the number only is hard for a 7B model, so exact scores are low on every arm. The test cannot separate small quality changes at n=50; agreement with bf16 is the more direct check on quantization.
+Multiplication answered with the number only is hard for a small model, so exact scores are low on every arm. A test this small cannot separate small quality changes; agreement with the full-precision reference is the more direct check on quantization.
 
 ## Cold starts (one observation each)
 
@@ -92,4 +92,4 @@ The boot split subtracts this machine's clock from the container's clock, so it 
 | together | 1.480 | tokens at posted price (sweeps only) |
 | **Total** | **3.41** | |
 
-How to read cost: self-hosted cost per 1,000 requests is the container price divided by the measured request rate, at the share of time the GPU is busy. Together's is its posted input and output price at the measured token counts, and does not depend on load. Together's throughput is what this client saw on a shared fleet with rate limits, not the capacity of one GPU.
+How to read cost: a per-GPU arm's cost per 1,000 requests is its hourly price divided by the measured request rate, at the share of time the GPU is busy. Together serverless uses its posted input and output price at the measured token counts, and does not depend on load. Its throughput is what this client saw on a shared fleet with rate limits, not the capacity of one GPU.

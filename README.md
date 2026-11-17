@@ -1,6 +1,6 @@
 # inference-poc
 
-A 48-hour inference proof of concept (POC), run the way a solutions architect runs one for a customer. It serves an open-weight model on self-hosted vLLM, sweeps load, applies one tuning change at a time, and prices the result per 1,000 requests. The benchmark code only calls an OpenAI-compatible endpoint, so any provider fits. I ran it on [Modal](https://modal.com) with one NVIDIA L40S. I then pointed the same harness at Together's serverless API as a reference point.
+A 48-hour inference proof of concept (POC), run the way a solutions architect runs one for a customer. It serves an open-weight model on self-hosted vLLM, sweeps load, applies one tuning change at a time, and prices the result per 1,000 requests. The benchmark code only calls an OpenAI-compatible endpoint, so any provider fits. I ran it on [Modal](https://modal.com) with one NVIDIA L40S. I then pointed the same harness at Together's serverless API as a reference point. Last, I ran a matched comparison: the same model on one H100, on Modal with vLLM and on a Together dedicated endpoint.
 
 **Why this exists.** I have benchmarked search and AI pipelines for customers with large media libraries. I had not stood up a GPU serving stack myself. So I took the standard POC loop: traffic shape, endpoint, benchmark, tune, price. I ran it end to end on real hardware and measured each step twice where I could.
 
@@ -70,6 +70,50 @@ How to read this, and how not to:
 - **The first attempt was less clean.** In my first run, a few requests at 16 or more concurrent waited 30–55 s for the first token and then streamed at normal speed. One request took 145 s end to end. A second full run later the same day had none: the slowest request took 12 s. I can't tell the cause from the client side; a new account's rate limit is one candidate. The first attempt's rows are in [results/together-attempt1/](results/together-attempt1/).
 - **Quality:** 25 of 50 on the arithmetic check, against 21 of 50 for my bf16 arm. It is a different model, so this says nothing about quantization.
 
+## Matched: the same model on one H100
+
+The serverless arm above is not a fair comparison, so I ran a matched one. Every arm uses Qwen3.5-9B with thinking off, one H100, one replica, and the same harness, prompts and client. Each provider uses its own FP8 build of the model. Full rows: [results/matched/summary.md](results/matched/summary.md).
+
+- **M1:** Modal, vLLM 0.18.1, [RedHatAI/Qwen3.5-9B-FP8-dynamic](https://huggingface.co/RedHatAI/Qwen3.5-9B-FP8-dynamic), no speculative decoding.
+- **M2:** M1 plus vLLM's MTP speculative decoding. MTP (multi-token prediction) uses a draft layer that ships with Qwen3.5 to propose the next token.
+- **T1:** a Together [dedicated endpoint](https://docs.together.ai/docs/dedicated-inference) with the 1x H100 FP8 configuration for this model. On Together, speculative decoding is a property of the configuration you pick ([configs](https://docs.together.ai/docs/dedicated-endpoints/configs)). On 2026-11-16 no configuration for this model had a speculator, so T1 runs without one, like M1.
+
+Chat traffic, about 1,000 tokens in and 250 out. Each cell is M1 / M2 / T1.
+
+| Concurrent requests | Time per output token p50 | Output tok/s | TTFT p50 | Gap between tokens p99 | Goodput |
+|---|---|---|---|---|---|
+| 1 | 5.4 / 5.0 / 5.3 ms | 151 / 159 / 157 | 326 / 331 / 258 ms | 64 / 72 / 19 ms | 100 / 100 / 100% |
+| 4 | 5.6 / 5.5 / 5.5 ms | 565 / 569 / 586 | 364 / 373 / 318 ms | 64 / 71 / 19 ms | 100 / 100 / 100% |
+| 16 | 6.6 / 6.2 / 6.5 ms | 1,834 / 1,878 / 1,908 | 540 / 596 / 481 ms | 70 / 79 / 23 ms | 100 / 100 / 100% |
+| 64 | 11.4 / 10.8 / 11.0 ms | 4,114 / 4,161 / 4,354 | 1,059 / 1,162 / 936 ms | 156 / 171 / 45 ms | 47 / 39 / 56% |
+| 4, on an 8,000-token document | 6.7 / 6.2 / 5.6 ms | 419 / 435 / 547 | 729 / 740 / 429 ms | 70 / 94 / 22 ms | 100 / 98 / 100% |
+
+What the matched run shows:
+- **At low and medium load, decode speed is the same within about 5%.** For a 9B model on one H100, the GPU's memory bandwidth sets the speed of each token, whoever runs the stack.
+- **Together pulled ahead where the work gets harder.** At 64 concurrent requests it gave 6% more output and 56% goodput against 47%. On the 8,000-token document it gave 31% more output (547 against 419 tok/s), and TTFT p50 was 429 ms against 729 ms. I cannot say which part of Together's stack causes this: the engine, kernels, FP8 build, scheduler and host machine all differ.
+- **Tokens arrived more evenly from Together.** The 99th-percentile gap between streamed tokens was 19–45 ms on Together and 64–171 ms on Modal. Modal's web proxy may group stream chunks, so I do not credit this to the GPU.
+- **vLLM's MTP accepted 72% of drafted tokens (1.72 tokens per step) but cut time per token by only 2–8%.** At 64 concurrent requests, M2's goodput fell to 39%. I did not profile why. A speculator trained for the customer's traffic could do better; this one ships with the model.
+- **The repeats agreed.** I ran 1 and 16 concurrent requests twice on each arm. Output tok/s changed by 1% or less, except M2 at 1 concurrent request (159 against 149).
+- **Read TTFT with care.** Client TTFT includes the network path. The round trip was 111 ms to Modal and 125 ms to Together's API. Together reported the replica in eu-west-1, and the Modal containers ran in us-east, yet Together's TTFT was lower. I did not find out how traffic reached the replica. That is why the table leads with time per token and output rate.
+
+**Quality.** 200 arithmetic questions at temperature 0, each answered with the number only. Agreement means the same answer as Modal's bf16 reference on an L40S.
+
+| Arm | Exact | Same answer as the bf16 reference |
+|---|---|---|
+| M1: Modal FP8 | 103/200 | 175/200 |
+| M2: Modal FP8 with MTP | 104/200 | 170/200 |
+| T1: Together FP8 | 102/200 | 176/200 |
+| Together bf16, 1x H100 | 106/200 | 181/200 |
+| Modal bf16, L40S (the reference) | 105/200 | n/a |
+
+Two full-precision builds agreed on 181 of 200, and M1 and M2 agreed on 179 of 200, although speculative decoding is designed not to change answers. So small numeric differences under batching change about one answer in ten. Both FP8 builds fall inside that band. This test shows no quality loss from either FP8 build, and it is too small to prove there is none.
+
+**Cost.** Together dedicated costs $5.49 per H100 hour ([pricing](https://www.together.ai/pricing)). The Modal container costs $5.29 per hour: $3.95 for the H100 plus 4 CPU cores and 32 GiB of memory ([pricing](https://modal.com/pricing)). At the same speed, cost per request is close to equal: $0.20 per 1,000 chat requests at 16 concurrent on both, at 100% busy. On the 8,000-token document, Together was cheaper per request because it was faster: $0.70 against $0.88 per 1,000.
+
+**Startup.** Modal took 355 s (M1) and 390 s (M2) from the first request to the first token, on a warm image. Together took 310 s from the create request to a ready replica. One observation each.
+
+**What this does not show.** One replica cannot show routing across replicas, autoscaling or cache-aware routing. I could not test Together's own speculators, because this model has none listed. The prompts are synthetic, each cell has one run plus the two repeats, and the quality check is arithmetic only.
+
 ## What I would hand to a managed platform
 
 Running this myself showed what the work is. Each row is something I had to do or pay for by hand.
@@ -86,12 +130,12 @@ The choice is the usual build or buy question. Self-hosting can be cheaper for s
 
 ## What I did not test
 
-- **Together on matched terms.** The Together arm is serverless, on a different model and unknown GPUs. I did not test a dedicated endpoint, the same model on both sides, or the same GPU. I also did not find Together's rate limit, and I did not measure server-side latency there, only client latency.
+- **Together at scale.** The matched run is one dedicated replica. I did not find the serverless rate limit, and Together exposes no server-side TTFT, so its latency is client-side only.
 - **Answer quality, properly.** 50 arithmetic questions with "number only" answers is too hard for a 7B model and too small to detect a small change. A real POC uses the customer's prompts and a task-specific grader.
 - **The bf16 vs fp8 goodput gap.** Goodput (the share of requests that meet the latency target) uses client TTFT. The bf16 container had a much slower network path, so its goodput is lower for reasons that have nothing to do with FP8. The bf16 container also showed 290 ms gaps between some streamed tokens, against about 30 ms on fp8 at concurrency 1 and 4. This is probably the same network path, but I did not prove it.
-- **Scale.** One GPU type, one model size, one replica. No tensor parallelism, no autoscaling under load, no speculative decoding.
+- **Scale.** One replica per arm. No tensor parallelism and no autoscaling under load. Speculative decoding only as vLLM's MTP on the matched run.
 - **Production traffic.** All prompts are synthetic, with fixed seeds, and every arm got the same prompts.
-- **Repeat runs.** Each cell is one run. Cold starts are one observation each.
+- **Repeat runs.** Each L40S cell is one run. The matched run repeats 1 and 16 concurrent requests. Cold starts are one observation each.
 
 ## How it works
 
@@ -121,7 +165,7 @@ Each variant is its own Modal app (`inference-poc-<variant>`) with the settings 
 
 ```bash
 uv sync
-uv run pytest                                      # 11 tests, fake server, no cost
+uv run pytest                                      # 22 tests, fake servers, no cost
 
 uv run modal setup                                 # links this machine to your Modal account
 scripts/setup_modal.sh                             # endpoint key, secret, weights; no GPU time
@@ -132,12 +176,21 @@ uv run python scripts/report.py final
 
 For the Together arm, put `TOGETHER_API_KEY` in `.env` (see `.env.example`) and run `--phases together --run-id final`. The results go into the same report.
 
+The matched run needs a Together project API key in `.env`. A dedicated endpoint bills per minute until it is deleted, so every phase stops and deletes it on exit, and `scripts/stop_all.py` removes anything left over:
+
+```bash
+uv run python scripts/stop_all.py --check          # lists anything still running; exits 1 if so
+uv run python scripts/run_poc.py --phases m1,m2,t1,ref,tref --run-id matched
+uv run python scripts/report.py matched
+```
+
 ## What this run cost
 
-$3.50 logged in total, against a budget stop of $8 in `config/poc.yaml`.
+$10.49 logged in total, against a budget stop of $14 in `config/poc.yaml` ($8 before the matched run).
 
 - **Modal: $1.34.** The smoke test $0.08, bf16 $0.59, fp8 $0.49 and the no-cache arm $0.17 (including a first attempt that failed on a network timeout). These are upper bounds: container seconds from the first request to the stop.
 - **Together: $2.16** at the posted token price: $1.48 for the final run and $0.68 for the first attempt.
+- **Matched run: $6.99.** M1 $1.37, plus $2.22 for a first M1 start that never came up (see below). M2 $1.42, Together FP8 $1.40, the L40S bf16 reference $0.25, and Together bf16 $0.34. These are upper bounds: Modal container seconds, and Together time from the create request to the stop.
 
 ## What went wrong, and what I changed
 
@@ -150,3 +203,9 @@ What I changed, each with an offline test:
 - **The network probe for a hosted API** now uses a small response. The old probe downloaded Together's 436 KB model list, so it measured download time.
 
 The lesson I would carry into a customer POC: a spend guard that checks after each step does not protect a step that never finishes. Cap the request rate before the first paid request.
+
+The matched run had two setup failures of its own:
+- **A tokenizer the engine could not load.** The FP8 checkpoint names a tokenizer class that only exists in transformers 5, and vLLM 0.18.1 requires transformers 4. The container crashed on start and restarted until my 25-minute health check gave up, at a cost of $2.22. The fix loads the tokenizer from the base `Qwen/Qwen3.5-9B` repo, which has the same tokenizer files. I checked the fix on a CPU-only container before the next GPU start. The health check now gives up after 15 minutes.
+- **Arguments lost on the way into the container.** Modal's image environment step removed the backslashes in a JSON argument, so the container could not parse its own settings. The arguments now go in base64-encoded.
+
+The lesson: check that the model loads on a cheap machine before paying for a GPU. A crash on start costs as much as a benchmark.

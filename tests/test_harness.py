@@ -231,3 +231,183 @@ def test_a_request_past_the_deadline_is_an_error(monkeypatch):
         srv.shutdown()
     assert r["error"].startswith("deadline")
     assert r["e2e_s"] < 0.5
+
+
+# ---------- matched comparison: per-variant price, Together dedicated lifecycle, stops ----------
+
+def test_modal_cost_uses_each_variants_own_price():
+    cfg = yaml.safe_load(open("config/poc.yaml"))
+    m = ModalVLLM(cfg["providers"]["modal_vllm"], "x")
+    mc = cfg["providers"]["modal_vllm"]
+    h100 = 0.001097 + 4 * mc["usd_per_sec_core"] + 32 * mc["usd_per_sec_gib"]
+    assert m.usd_per_sec("h100-q35-fp8") == pytest.approx(h100)
+    assert m.usd_per_sec("fp8") == pytest.approx(m.usd_per_sec())          # L40S variants keep the L40S price
+    assert m.run_cost_usd([], 3600, "h100-q35-fp8") == pytest.approx(h100 * 3600)
+    assert m.variant_cfg("h100-q35-fp8")["served_name"] == "Qwen/Qwen3.5-9B"
+    assert m.variant_cfg("fp8")["served_name"] == "x"
+    assert m.variant_cfg("h100-q35-fp8")["min_tokens"] is False and m.variant_cfg("fp8")["min_tokens"] is True
+
+
+class FakeTogetherAPI:
+    """Just enough of Together's v2 dedicated API to drive the lifecycle offline."""
+
+    def __init__(self, ready_after: int = 2, fail: bool = False):
+        self.endpoints: dict[str, dict] = {}
+        self.deps: dict[str, dict] = {}
+        self.polls = 0
+        self.ready_after, self.fail = ready_after, fail
+        self.calls: list[str] = []
+
+    def handler(self, request):
+        import httpx
+        m, path = request.method, request.url.path
+        self.calls.append(f"{m} {path}")
+        body = json.loads(request.content) if request.content else {}
+        if path == "/v3/whoami":
+            return httpx.Response(200, json={"type": "project_api_key", "project": {"id": "proj_x", "slug": "me"}})
+        parts = path.split("/")   # ['', 'v2', 'projects', 'proj_x', 'endpoints', ...]
+        if parts[4:] == ["endpoints"]:
+            if m == "GET":
+                return httpx.Response(200, json={"data": list(self.endpoints.values())})
+            e = {"id": f"ep_{len(self.endpoints)}", "name": "me/" + body["name"]}
+            self.endpoints[e["id"]] = e
+            return httpx.Response(200, json=e)
+        if len(parts) == 6:   # /endpoints/{id}
+            if m == "DELETE":
+                self.endpoints.pop(parts[5])
+            return httpx.Response(200, json=self.endpoints.get(parts[5], {}))
+        ep_id = parts[5]
+        if len(parts) == 7:   # /endpoints/{id}/deployments
+            if m == "GET":
+                return httpx.Response(200, json={"data": [d for d in self.deps.values() if d["ep"] == ep_id]})
+            d = {"id": f"dep_{len(self.deps)}", "ep": ep_id, "status": {"state": "DEPLOYMENT_STATE_PROVISIONING"},
+                 "body": body}
+            self.deps[d["id"]] = d
+            return httpx.Response(200, json=d)
+        d = self.deps[parts[7]]
+        if m == "GET":
+            self.polls += 1
+            if d["status"]["state"] == "DEPLOYMENT_STATE_PROVISIONING" and self.polls >= self.ready_after:
+                d["status"]["state"] = "DEPLOYMENT_STATE_FAILED" if self.fail else "DEPLOYMENT_STATE_READY"
+            return httpx.Response(200, json=d)
+        if m == "PATCH":
+            a = body.get("autoscaling", {})
+            if a.get("minReplicas") == 0 and a.get("maxReplicas") == 0:
+                d["status"]["state"] = "DEPLOYMENT_STATE_STOPPED"
+            return httpx.Response(200, json=d)
+        if m == "DELETE":
+            self.deps.pop(d["id"])
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+
+def dedicated_for(api, monkeypatch):
+    import httpx
+    from providers.together_dedicated import TogetherDedicated
+    monkeypatch.setenv("TOGETHER_API_KEY", "test-key")
+    cfg = yaml.safe_load(open("config/poc.yaml"))["providers"]["together_dedicated"]
+    client = httpx.Client(base_url="https://api.together.ai", transport=httpx.MockTransport(api.handler))
+    return TogetherDedicated(cfg, client=client, poll_s=0)
+
+
+def test_dedicated_start_waits_for_ready_and_stop_deletes_everything(monkeypatch):
+    api = FakeTogetherAPI(ready_after=3)
+    p = dedicated_for(api, monkeypatch)
+    ep = p.start("h100-fp8")
+    assert ep.model == "me/inference-poc-h100-fp8" and not ep.shared_fleet and not ep.honours_min_tokens
+    dep = next(iter(api.deps.values()))
+    assert dep["body"]["autoscaling"]["minReplicas"] == dep["body"]["autoscaling"]["maxReplicas"] == 1
+    assert dep["body"]["inactiveTimeout"] >= 30 and dep["body"]["autoscaling"]["scaleToZeroWindow"].endswith("s")
+    assert p.stop("h100-fp8") == []
+    assert api.endpoints == {} and api.deps == {}
+
+
+def test_dedicated_start_failure_still_deletes(monkeypatch):
+    from providers.together_dedicated import DedicatedError
+    api = FakeTogetherAPI(ready_after=1, fail=True)
+    p = dedicated_for(api, monkeypatch)
+    with pytest.raises(DedicatedError):
+        p.start("h100-fp8")
+    assert api.endpoints == {}
+
+
+def test_dedicated_refuses_to_start_over_a_leftover(monkeypatch):
+    from providers.together_dedicated import DedicatedError
+    api = FakeTogetherAPI()
+    api.endpoints["ep_old"] = {"id": "ep_old", "name": "me/inference-poc-h100-fp8"}
+    p = dedicated_for(api, monkeypatch)
+    with pytest.raises(DedicatedError):
+        p.start("h100-fp8")
+    assert not api.deps
+
+
+class FakeDedicatedProvider:
+    """Stands in for TogetherDedicated in dedicated_phase: serves the fake server, records stop()."""
+
+    def __init__(self, url):
+        self.url, self.stopped, self.ready_at = url, [], {}
+
+    def start(self, variant):
+        import time as _t
+        self.ready_at[variant] = _t.time()
+        return ep_for(self.url, self_hosted=False)
+
+    def stop(self, variant):
+        self.stopped.append(variant)
+        return []
+
+    def run_cost_usd(self, rows, billed_seconds, variant=None):
+        return billed_seconds * 5.49 / 3600
+
+
+def _run(tmp_path, monkeypatch, minutes=40):
+    from scripts import run_poc
+    monkeypatch.setattr(run_poc, "ROOT", tmp_path)
+    monkeypatch.setattr(run_poc, "CALIBRATION", tmp_path / "results" / "calibration.json")
+    cfg = yaml.safe_load(open("config/poc.yaml"))
+    cfg["workloads"]["chat"].update({"duration_s": 0.5})
+    cfg["workloads"]["quality"]["n"] = 3
+    cfg["matched"]["phase_minutes"] = minutes
+    run = run_poc.Run("t", cfg)
+    run.leftovers = lambda c: []
+    return run_poc, run
+
+
+def test_dedicated_phase_stops_and_logs_spend_when_the_wall_clock_runs_out(server, tmp_path, monkeypatch):
+    _, url = server
+    run_poc, run = _run(tmp_path, monkeypatch, minutes=0)
+    prov = FakeDedicatedProvider(url)
+    with pytest.raises(run_poc.WallClockStop):
+        run.dedicated_phase(prov, "t1", "h100-fp8", ["chat"], [1, 4])
+    assert prov.stopped == ["h100-fp8"]
+    assert [e["phase"] for e in run.ledger.for_run("t")] == ["t1"]
+    levels = (tmp_path / "results" / "t" / "levels.jsonl").read_text().splitlines()
+    assert len(levels) == 1   # stopped after the first level
+
+
+def test_dedicated_phase_stops_on_an_error(server, tmp_path, monkeypatch):
+    _, url = server
+    run_poc, run = _run(tmp_path, monkeypatch)
+    prov = FakeDedicatedProvider(url)
+
+    def boom(*a, **k):
+        raise RuntimeError("benchmark crashed")
+    monkeypatch.setattr(run, "measure", boom)
+    with pytest.raises(RuntimeError):
+        run.dedicated_phase(prov, "t1", "h100-fp8", ["chat"])
+    assert prov.stopped == ["h100-fp8"]
+
+
+def test_a_paid_phase_refuses_to_start_while_something_runs(server, tmp_path, monkeypatch):
+    _, url = server
+    run_poc, run = _run(tmp_path, monkeypatch)
+    run.leftovers = lambda c: ["together: me/inference-poc-h100-fp8"]
+    prov = FakeDedicatedProvider(url)
+    with pytest.raises(OverBudget):
+        run.dedicated_phase(prov, "t1", "h100-fp8", ["chat"])
+    assert prov.stopped == [] and not prov.ready_at
+
+
+def test_natural_prompts_are_varied_and_repeatable():
+    ps = [P.natural_prompt(i) for i in range(120)]
+    assert len(set(ps)) == 120 and P.natural_prompt(7) == ps[7]

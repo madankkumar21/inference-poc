@@ -1,0 +1,146 @@
+model:
+  served_name: Qwen/Qwen2.5-7B-Instruct
+  together_id: Qwen/Qwen3.5-9B
+slo:
+  ttft_s: 1.0
+  e2e_s: 15.0
+workloads:
+  chat:
+    input_tokens: 1000
+    output_tokens: 250
+    concurrency:
+    - 1
+    - 4
+    - 16
+    - 32
+    - 64
+    - 128
+    together_max_concurrency: 64
+    duration_s: 60
+  long_context:
+    input_tokens: 8000
+    output_tokens: 250
+    concurrency:
+    - 4
+    duration_s: 60
+  open_loop:
+    input_tokens: 1000
+    output_tokens: 250
+    load_fractions:
+    - 0.5
+    - 0.8
+    duration_s: 60
+  quality:
+    n: 200
+  natural:
+    input_tokens: 40
+    output_tokens: 250
+    concurrency:
+    - 1
+    - 16
+    duration_s: 60
+matched:
+  levels:
+  - 1
+  - 4
+  - 16
+  - 64
+  repeat_levels:
+  - 1
+  - 16
+  phase_minutes: 40
+  health_timeout_min: 15
+  quality_reference:
+  - modal_vllm
+  - l40s-q35-bf16
+min_n_for_p95: 100
+providers:
+  together:
+    base_url: https://api.together.xyz/v1
+    usd_per_m_input: 0.17
+    usd_per_m_output: 0.25
+    extra_body:
+      reasoning:
+        enabled: false
+  together_dedicated:
+    base_url: https://api.together.xyz/v1
+    usd_per_gpu_hour: 5.49
+    scale_to_zero_s: 600
+    inactive_timeout_min: 30
+    ready_timeout_s: 1800
+    stop_timeout_s: 600
+    extra_body:
+      reasoning:
+        enabled: false
+    variants:
+      h100-fp8:
+        model: projects/proj_CbGpV8orZSw72BARMZy4i/models/ml_Cbuqh6mfYmt2AHL5kzDb7
+        config: projects/proj_CbGpV8orZSw72BARMZy4i/configs/cr_Cggnup6comZCBwzTyBJkV
+        gpu_count: 1
+      h100-bf16:
+        model: projects/proj_CbGpV8orZSw72BARMZy4i/models/ml_CbuqU8KKAtoGrowco4nqK
+        config: projects/proj_CbGpV8orZSw72BARMZy4i/configs/cr_CggnumBWbnG8WMfoAm31y
+        gpu_count: 1
+  modal_vllm:
+    gpu: L40S
+    cpu_cores: 2
+    memory_gib: 24
+    usd_per_sec_gpu: 0.000542
+    usd_per_sec_core: 3.942e-05
+    usd_per_sec_gib: 6.67e-06
+    utilization_cases:
+    - 1.0
+    - 0.3
+    variants:
+      bf16:
+        weights: Qwen/Qwen2.5-7B-Instruct
+        args: []
+      fp8:
+        weights: RedHatAI/Qwen2.5-7B-Instruct-FP8-dynamic
+        args: []
+      bf16-nocache:
+        weights: Qwen/Qwen2.5-7B-Instruct
+        args:
+        - --no-enable-prefix-caching
+      h100-q35-fp8:
+        weights: RedHatAI/Qwen3.5-9B-FP8-dynamic
+        served_name: Qwen/Qwen3.5-9B
+        gpu: H100!
+        usd_per_sec_gpu: 0.001097
+        cpu_cores: 4
+        memory_gib: 32
+        vllm: 0.18.1
+        min_tokens: false
+        args:
+        - --tokenizer
+        - Qwen/Qwen3.5-9B
+        - --language-model-only
+        - --default-chat-template-kwargs
+        - '{"enable_thinking": false}'
+      h100-q35-fp8-mtp:
+        weights: RedHatAI/Qwen3.5-9B-FP8-dynamic
+        served_name: Qwen/Qwen3.5-9B
+        gpu: H100!
+        usd_per_sec_gpu: 0.001097
+        cpu_cores: 4
+        memory_gib: 32
+        vllm: 0.18.1
+        min_tokens: false
+        args:
+        - --tokenizer
+        - Qwen/Qwen3.5-9B
+        - --language-model-only
+        - --default-chat-template-kwargs
+        - '{"enable_thinking": false}'
+        - --speculative-config
+        - '{"method": "mtp", "num_speculative_tokens": 1}'
+      l40s-q35-bf16:
+        weights: Qwen/Qwen3.5-9B
+        served_name: Qwen/Qwen3.5-9B
+        vllm: 0.18.1
+        min_tokens: false
+        args:
+        - --language-model-only
+        - --default-chat-template-kwargs
+        - '{"enable_thinking": false}'
+budget_usd: 14.0

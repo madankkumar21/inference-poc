@@ -15,6 +15,7 @@ class Endpoint:
     extra_body: dict = field(default_factory=dict)   # provider-only request fields
     metrics_url: str | None = None                   # Prometheus /metrics, self-hosted only
     honours_min_tokens: bool = False                 # vLLM does; then every request generates the full output
+    shared_fleet: bool = False                       # serverless: past a point we measure the rate limit, not a GPU
 
 
 class Provider:
